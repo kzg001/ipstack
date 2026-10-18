@@ -27,6 +27,8 @@ const TWO_MSL: Duration = Duration::from_secs(2);
 const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a session outlives the stream the application dropped, to finish its close.
+const ORPHAN_TIMEOUT: Duration = Duration::from_secs(30);
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[non_exhaustive]
@@ -171,7 +173,8 @@ pub struct IpStackTcpStream {
     drain_notify: Arc<tokio::sync::Notify>,
     arm_notify: Arc<tokio::sync::Notify>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
-    exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Tells the session task the application dropped the stream.
+    dropped: Arc<tokio::sync::Notify>,
     temp_read_buffer: Vec<u8>,
     config: Arc<TcpConfig>,
 }
@@ -209,11 +212,7 @@ impl IpStackTcpStream {
         );
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
-            if !tcp.rst
-                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, ACK | RST, None, None)
-            {
-                log::warn!("Error sending RST/ACK packet: {err}");
-            }
+            // The stack answers such a segment with `reset_for_no_connection` before it gets here.
             let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
         }
@@ -240,7 +239,7 @@ impl IpStackTcpStream {
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             arm_notify: Arc::new(tokio::sync::Notify::new()),
             task_handle: None,
-            exit_notifier: None,
+            dropped: Arc::new(tokio::sync::Notify::new()),
             temp_read_buffer: Vec::new(),
             config,
         };
@@ -464,28 +463,56 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
     Ok(())
 }
 
+/// Moves the close of a session whose stream was dropped one step on, once its sent data is all
+/// acknowledged: no one is left to call `shutdown`, so the FIN goes out from here. Returns whether
+/// it moved to LAST-ACK, where the caller waits for the peer's last ACK.
+fn close_orphan(sender: &PacketSender, nt: NetworkTuple, tcb: &mut Tcb) -> std::io::Result<bool> {
+    if tcb.get_inflight_packets_total_len() != 0 {
+        return Ok(false);
+    }
+    match tcb.get_state() {
+        TcpState::Established => send_fin_n_change_state_to_fin_wait1("[orphan]", nt, sender, tcb).map(|()| false),
+        TcpState::CloseWait => {
+            write_packet_to_device(sender, nt, tcb, None, ACK | FIN, None, None)?;
+            tcb.increase_seq();
+            tcb.change_state(TcpState::LastAck);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// RFC 9293 §3.10.7.1: answers a segment that belongs to no connection with a reset the sender
+/// accepts, `<SEQ=SEG.ACK><CTL=RST>` when it carries an ACK, else
+/// `<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`.
+pub(crate) fn reset_for_no_connection(sender: &PacketSender, nt: NetworkTuple, tcp: &TcpHeader, payload_len: usize) -> std::io::Result<()> {
+    let (src, dst) = (nt.dst, nt.src);
+    let packet = if tcp.ack {
+        create_raw_packet(src, dst, |_, _| 0, RST, TTL, tcp.acknowledgment_number, 0, 0, Vec::new(), &[])?
+    } else {
+        let len = payload_len as u32 + u32::from(tcp.syn) + u32::from(tcp.fin);
+        let ack = tcp.sequence_number.wrapping_add(len);
+        create_raw_packet(src, dst, |_, _| 0, ACK | RST, TTL, 0, ack, 0, Vec::new(), &[])?
+    };
+    sender.send(packet).map_err(|e| std::io::Error::new(UnexpectedEof, e))
+}
+
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
-                // The farewell packet reaches the device through an unbounded channel, so it
-                // is sent here rather than left to the task.
-                {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    if let Err(e) = send_fin_n_change_state_to_fin_wait1("[drop]", nt, &self.up_packet_sender, &mut tcb) {
-                        log::debug!("{nt} {state:?}: [drop] cannot send the farewell packet: {e}");
-                    }
+                // The session outlives the stream to finish its close: it sends the FIN if none
+                // went out yet, takes the peer's FIN and last ACK, and resets the connection if data
+                // arrives with no reader left or the close takes past `ORPHAN_TIMEOUT`. Nothing here
+                // waits for the task, so a drop never blocks.
+                let mut tcb = self.tcb.lock().unwrap();
+                if let Err(e) = send_fin_n_change_state_to_fin_wait1("[drop]", nt, &self.up_packet_sender, &mut tcb) {
+                    log::debug!("{nt} {state:?}: [drop] cannot send the farewell packet: {e}");
                 }
-                if let Some(notifier) = self.exit_notifier.take() {
-                    // The channel holds ten slots and one signal ends the task, so the send
-                    // needs no runtime of its own.
-                    _ = notifier.try_send(());
-                }
-                // Dropping the task drops its `destroy_messenger`, which wakes the watcher
-                // that removes this session from the stack.
-                task_handle.abort();
+                drop(tcb);
+                self.dropped.notify_one();
             } else {
                 log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
             }
@@ -509,12 +536,12 @@ impl IpStackTcpStream {
         let data_tx = self.data_tx.clone();
         let drain_notify = self.drain_notify.clone();
         let arm_notify = self.arm_notify.clone();
+        let dropped = self.dropped.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
         let exit_notifier = exit_task_notifier.clone();
         let config = self.config.clone();
-        self.exit_notifier = Some(exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
             let v = tcp_main_logic_loop(
@@ -529,6 +556,7 @@ impl IpStackTcpStream {
                 data_tx,
                 drain_notify,
                 arm_notify,
+                dropped,
                 exit_monitor,
             )
             .await;
@@ -559,6 +587,7 @@ async fn tcp_main_logic_loop(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     drain_notify: Arc<tokio::sync::Notify>,
     arm_notify: Arc<tokio::sync::Notify>,
+    dropped: Arc<tokio::sync::Notify>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
@@ -676,10 +705,43 @@ async fn tcp_main_logic_loop(
         Ok::<(), std::io::Error>(())
     }
 
+    // Set once the application dropped the stream: the session then finishes its close alone and
+    // is reset if that takes past this deadline.
+    let mut orphan_deadline: Option<tokio::time::Instant> = None;
+    let exit_notifier_for_orphan = exit_notifier.clone();
+
     loop {
         let exit_notifier = exit_notifier.clone();
 
         let network_packet = tokio::select! {
+            _ = dropped.notified(), if orphan_deadline.is_none() => {
+                orphan_deadline = Some(tokio::time::Instant::now() + ORPHAN_TIMEOUT);
+                let mut tcb = tcb.lock().unwrap();
+                if tcb.get_state() == TcpState::Closed {
+                    break;
+                }
+                if close_orphan(&up_packet_sender, network_tuple, &mut tcb)? {
+                    tokio::spawn(task_last_ack(
+                        tcb_clone.clone(),
+                        exit_notifier.clone(),
+                        network_tuple,
+                        up_packet_sender.clone(),
+                        config.last_ack_timeout,
+                        config.last_ack_max_retries,
+                    ));
+                }
+                continue;
+            }
+            _ = tokio::time::sleep_until(orphan_deadline.unwrap_or_else(tokio::time::Instant::now)), if orphan_deadline.is_some() => {
+                let mut tcb = tcb.lock().unwrap();
+                let state = tcb.get_state();
+                log::debug!("{network_tuple} {state:?}: dropped stream still not closed after {ORPHAN_TIMEOUT:?}, resetting");
+                if state != TcpState::Closed {
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
+                    tcb.change_state(TcpState::Closed);
+                }
+                break;
+            }
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
                 read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -774,6 +836,16 @@ async fn tcp_main_logic_loop(
         }
         if pkt_type == PacketType::Invalid {
             continue;
+        }
+
+        // RFC 9293 §3.10.7.4: new data for a stream the application dropped has no reader left.
+        // A retransmission of data already taken is only acknowledged, as before.
+        let new_data = !payload.is_empty() && incoming_seq + payload.len() as u32 > tcb.get_ack();
+        if orphan_deadline.is_some() && new_data && pkt_type == PacketType::NewPacket {
+            log::debug!("{network_tuple} {state:?}: data after the stream was dropped, resetting");
+            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
+            tcb.change_state(TcpState::Closed);
+            break;
         }
 
         match state {
@@ -1010,6 +1082,16 @@ async fn tcp_main_logic_loop(
 
         tcb.update_last_received_ack(incoming_ack);
         tcb.update_send_window(tcp_header);
+        if orphan_deadline.is_some() && close_orphan(&up_packet_sender, network_tuple, &mut tcb)? {
+            tokio::spawn(task_last_ack(
+                tcb_clone.clone(),
+                exit_notifier_for_orphan.clone(),
+                network_tuple,
+                up_packet_sender.clone(),
+                config.last_ack_timeout,
+                config.last_ack_max_retries,
+            ));
+        }
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -1714,5 +1796,142 @@ mod tests {
             .expect("no window update after the reader drained");
         assert_eq!(update.acknowledgment_number, seq);
         assert!(update.window_size as usize >= 1460, "the update does not reopen the window");
+    }
+
+    /// The peer closes first and the application drops the stream once both directions ended,
+    /// before the peer's last ACK arrives. The session still takes that ACK: it is closed, without
+    /// resending its FIN or answering with a reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_stream_takes_the_last_ack() {
+        let (stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        sender.send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[])).unwrap();
+        let replies = written(&mut up_rx).await;
+        assert!(replies.iter().any(|p| tcp_header_of(p).fin), "no FIN after the peer's FIN");
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::LastAck);
+
+        drop(stream);
+        let _ = sender.send(peer_ack(1002, local_seq + 1));
+        tokio::time::sleep(LAST_ACK_TIMEOUT * (LAST_ACK_MAX_RETRIES as u32 + 1)).await;
+
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+        let after = written(&mut up_rx).await;
+        assert!(after.is_empty(), "the closed session still wrote {} packet(s)", after.len());
+    }
+
+    /// The application drops the stream first: the stack sends its FIN, and the peer's FIN that
+    /// answers it is acknowledged, closing the connection the ordinary way instead of by reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_stream_completes_the_close() {
+        let (stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        drop(stream);
+        let fin = written(&mut up_rx).await;
+        assert!(fin.iter().any(|p| tcp_header_of(p).fin), "no FIN on drop");
+
+        let _ = sender.send(peer_segment(1001, local_seq + 1, ACK | FIN, u16::MAX, &[]));
+        let replies = written(&mut up_rx).await;
+        let last = tcp_header_of(replies.last().expect("the peer's FIN went unanswered"));
+        assert!(!last.rst, "the peer's FIN was answered with a reset");
+        assert!(last.ack && last.acknowledgment_number == 1002);
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::TimeWait);
+    }
+
+    /// Data arriving after the application dropped the stream has no reader: the connection is
+    /// reset (RFC 9293 §3.10.7.4), with a sequence number the peer accepts.
+    #[tokio::test(start_paused = true)]
+    async fn data_after_drop_resets_the_connection() {
+        let (stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        drop(stream);
+        written(&mut up_rx).await;
+        let _ = sender.send(peer_segment(1001, local_seq + 1, ACK | PSH, u16::MAX, b"late"));
+        let replies = written(&mut up_rx).await;
+        let rst = replies
+            .iter()
+            .map(tcp_header_of)
+            .find(|h| h.rst)
+            .expect("no reset for data after drop");
+        assert_eq!(rst.sequence_number, local_seq + 1);
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    /// A dropped stream whose peer never closes is reset after the orphan timeout, so the session
+    /// does not live on forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_stream_is_reset_when_the_peer_never_closes() {
+        let (stream, mut up_rx, local_seq) = established().await;
+        // The stack's session table holds a sender for as long as the session lives.
+        let _sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        drop(stream);
+        written(&mut up_rx).await;
+        tokio::time::sleep(ORPHAN_TIMEOUT + Duration::from_secs(1)).await;
+
+        let replies = written(&mut up_rx).await;
+        let rst = replies
+            .iter()
+            .map(tcp_header_of)
+            .find(|h| h.rst)
+            .expect("no reset at the orphan timeout");
+        assert_eq!(rst.sequence_number, local_seq + 1);
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    /// RFC 9293 §3.10.7.1: a segment for no connection is answered with a reset the sender
+    /// accepts, at the sequence number it acknowledged.
+    #[tokio::test]
+    async fn a_segment_for_no_connection_is_reset_at_its_ack() {
+        let nt = NetworkTuple::new(PEER.parse().unwrap(), LOCAL.parse().unwrap(), true);
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+
+        let mut fin = TcpHeader::new(12345, 80, 5000, u16::MAX);
+        (fin.ack, fin.fin, fin.acknowledgment_number) = (true, true, 7000);
+        reset_for_no_connection(&up_tx, nt, &fin, 0).unwrap();
+        let rst = up_rx.try_recv().expect("no reset");
+        let rst = tcp_header_of(&rst);
+        assert!(rst.rst && !rst.ack);
+        assert_eq!(rst.sequence_number, 7000);
+
+        let mut data = TcpHeader::new(12345, 80, 5000, u16::MAX);
+        data.psh = true;
+        reset_for_no_connection(&up_tx, nt, &data, 10).unwrap();
+        let rst = up_rx.try_recv().expect("no reset");
+        let rst = tcp_header_of(&rst);
+        assert!(rst.rst && rst.ack);
+        assert_eq!((rst.sequence_number, rst.acknowledgment_number), (0, 5010));
+    }
+
+    /// The close in the capture that left a macOS client resending its FIN: the upstream side
+    /// closes, the application drops the stream, and the client's FIN crosses the stack's. The
+    /// client's FIN is acknowledged and the session ends without a reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_stream_takes_a_crossing_fin() {
+        let (stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        drop(stream);
+        written(&mut up_rx).await;
+        // The client's FIN, sent before it saw the stack's: it does not acknowledge it.
+        let _ = sender.send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]));
+        let replies = written(&mut up_rx).await;
+        assert!(replies.iter().map(tcp_header_of).all(|h| !h.rst), "the crossing FIN was reset");
+        let ack = replies.iter().map(tcp_header_of).find(|h| h.ack && h.acknowledgment_number == 1002);
+        assert!(ack.is_some(), "the crossing FIN went unacknowledged");
+
+        // Then its ACK of the stack's FIN.
+        let _ = sender.send(peer_ack(1002, local_seq + 1));
+        tokio::time::sleep(TWO_MSL * 2).await;
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+        let after = written(&mut up_rx).await;
+        assert!(after.iter().map(tcp_header_of).all(|h| !h.rst), "a reset after the close");
     }
 }

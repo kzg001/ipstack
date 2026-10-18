@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub use self::tcp::IpStackTcpStream;
+pub(crate) use self::tcp::reset_for_no_connection;
 pub use self::tcp::{TcpConfig, TcpOptions};
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;

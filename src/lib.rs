@@ -415,6 +415,14 @@ fn create_stream(
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
+            if !h.syn && !h.rst {
+                // A segment for no connection: a session that already ended, or never existed.
+                let len = packet.payload.as_ref().map_or(0, Vec::len);
+                let nt = NetworkTuple::new(src_addr, dst_addr, true);
+                if let Err(err) = stream::reset_for_no_connection(&up_pkt_sender, nt, h, len) {
+                    log::warn!("Error sending RST packet: {err}");
+                }
+            }
             let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
             Ok(IpStackStream::Tcp(stream))
         }
