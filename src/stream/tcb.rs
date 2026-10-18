@@ -63,6 +63,9 @@ pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
+    /// `(ack, window)` of the last segment written to the device, raw (unscaled) window. Set from
+    /// `write_packet_to_device`, which only borrows the control block.
+    pub(super) advertised: std::cell::Cell<Option<(SeqNum, u16)>>,
     last_received_ack: SeqNum,
     send_window: u32,
     send_window_shift: u8,
@@ -125,6 +128,7 @@ impl Tcb {
             seq: seq.into(),
             ack,
             mtu,
+            advertised: std::cell::Cell::new(None),
             last_received_ack: seq.into(),
             send_window: peer_window as u32,
             send_window_shift,
@@ -271,6 +275,28 @@ impl Tcb {
     }
     pub(super) fn get_mtu(&self) -> u16 {
         self.mtu
+    }
+    /// The receive window a segment written now advertises, before scaling: zero below a full
+    /// segment (silly-window-syndrome avoidance).
+    pub(super) fn get_advertised_recv_window(&self) -> u16 {
+        let window = self.get_recv_window();
+        if window >= self.mtu { window } else { 0 }
+    }
+    pub(super) fn set_advertised(&self, ack: SeqNum, window: u16) {
+        self.advertised.set(Some((ack, window)));
+    }
+    /// RFC 9293 §3.8.6.2.2: an ACK is due for a freed window only when the acknowledgement moves
+    /// or the window grows enough to matter: at least doubles, which includes reopening from below
+    /// a segment (as Linux's `tcp_cleanup_rbuf`). Any smaller update repeats the last ACK, which the
+    /// peer reads as a duplicate ACK and answers with a fast retransmission (RFC 5681 §3.2).
+    pub(super) fn window_update_due(&self) -> bool {
+        match self.advertised.get() {
+            None => true,
+            Some((ack, window)) => {
+                let now = u32::from(self.get_advertised_recv_window());
+                ack != self.ack || (now > 0 && now >= 2 * u32::from(window))
+            }
+        }
     }
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack

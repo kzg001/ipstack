@@ -1041,6 +1041,7 @@ fn receive_segment(
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     tcb.add_unordered_packet(seq, payload);
+    // Every segment is answered (RFC 9293 §3.10.7.4), a duplicate one too.
     if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
@@ -1048,7 +1049,8 @@ fn receive_segment(
 }
 
 /// Hands acknowledged data to the reader. Returns whether an ACK was written, or none is due
-/// because the session is closed.
+/// because the session is closed. Called on arrivals and when the reader frees space; in the
+/// latter case it writes an ACK only for a change the peer needs to see.
 fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
@@ -1069,8 +1071,8 @@ fn extract_data_n_write_upstream(
     let permit = match data_tx.try_reserve() {
         Ok(permit) => permit,
         Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-            write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-            return Ok(true);
+            // The data stays queued for the reader; the caller answers an arrival.
+            return Ok(false);
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
             return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
@@ -1082,8 +1084,11 @@ fn extract_data_n_write_upstream(
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         permit.send(data);
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-        return Ok(true);
+        if tcb.window_update_due() {
+            write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
     Ok(false)
 }
@@ -1152,6 +1157,9 @@ pub(crate) fn write_packet_to_device(
     )?;
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
+    if flags & ACK != 0 {
+        tcb.set_advertised(tcb.get_ack(), tcb.get_advertised_recv_window());
+    }
     Ok(len)
 }
 
@@ -1633,5 +1641,78 @@ mod tests {
         assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
 
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
+    }
+
+    /// RFC 9293 §3.8.6.2.2 / RFC 1122 §4.2.3.3: a reader freeing space announces it only when the
+    /// window opens by a full segment. A second ACK for the same byte, sent for every segment once
+    /// the reader drains it, is a duplicate ACK to the peer, which fast-retransmits (RFC 5681 §3.2)
+    /// data it already delivered.
+    #[tokio::test]
+    async fn reading_does_not_repeat_the_ack_of_each_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        // Segments arrive back to back, as a sender's burst does; the reader catches up after
+        // each was acknowledged.
+        let mut seq = 1001;
+        let mut acks = Vec::new();
+        for len in [512, 512, 512, 299] {
+            stream
+                .stream_sender()
+                .send(peer_segment(seq, local_seq, ACK | PSH, u16::MAX, &vec![1; len]))
+                .unwrap();
+            seq += len as u32;
+        }
+        acks.extend(written(&mut up_rx).await.iter().map(|p| tcp_header_of(p).acknowledgment_number));
+        let mut buf = vec![0u8; 512 * 3 + 299];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        for _ in 0..4 {
+            acks.extend(written(&mut up_rx).await.iter().map(|p| tcp_header_of(p).acknowledgment_number));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let repeated: Vec<u32> = acks.iter().copied().filter(|a| !seen.insert(*a)).collect();
+        assert!(repeated.is_empty(), "ACKs {acks:?} repeat {repeated:?}");
+        assert_eq!(acks.last(), Some(&seq));
+    }
+
+    /// A reader freeing a full segment of window after the window had closed below one segment
+    /// announces it, so the peer leaves persist mode.
+    #[tokio::test]
+    async fn reading_reopens_a_window_closed_below_a_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        // The reader is away: data fills the receive buffer until less than a segment of window
+        // is left, as a peer sending exactly into the advertised window does.
+        let mut seq = 1001u32;
+        loop {
+            let room = stream.tcb.lock().unwrap().get_recv_window() as usize;
+            if room < 1460 {
+                break;
+            }
+            let len = room.min(1400);
+            stream
+                .stream_sender()
+                .send(peer_segment(seq, local_seq, ACK | PSH, u16::MAX, &vec![1; len]))
+                .unwrap();
+            seq += len as u32;
+            written(&mut up_rx).await;
+        }
+        let fill = (seq - 1001) as usize;
+        let (ack, window) = stream.tcb.lock().unwrap().advertised.get().unwrap();
+        assert_eq!(ack.0, seq);
+        assert_eq!(window, 0, "setup: the window is not closed below a segment");
+
+        // The reader catches up: the window reopens, and the peer is told once.
+        let mut buf = vec![0u8; fill];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        let mut updates = Vec::new();
+        for _ in 0..8 {
+            updates.extend(written(&mut up_rx).await);
+        }
+        let update = updates
+            .first()
+            .map(tcp_header_of)
+            .expect("no window update after the reader drained");
+        assert_eq!(update.acknowledgment_number, seq);
+        assert!(update.window_size as usize >= 1460, "the update does not reopen the window");
     }
 }
